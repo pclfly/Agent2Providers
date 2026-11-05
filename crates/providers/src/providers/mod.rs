@@ -42,6 +42,8 @@ pub mod lobsterai;
 pub mod loomy;
 #[cfg(feature = "modelscope")]
 pub mod modelscope;
+#[cfg(feature = "minimax")]
+pub mod minimax;
 #[cfg(feature = "monkeycode")]
 pub mod monkeycode;
 #[cfg(feature = "officeace")]
@@ -114,6 +116,9 @@ pub fn registry() -> Vec<BoxProvider> {
 
     #[cfg(feature = "loomy")]
     list.push(Box::new(loomy::LoomyProvider));
+
+    #[cfg(feature = "minimax")]
+    list.push(Box::new(minimax::MiniMaxProvider));
 
     // Qoder 的两个地区是两个 provider、两个实例（同一份实现按地区参数化）
     #[cfg(feature = "qoder")]
