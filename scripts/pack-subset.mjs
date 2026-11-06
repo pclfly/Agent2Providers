@@ -6,15 +6,53 @@
  * `pack.mjs` 打的是**官方全量包**：包 id 固定 `agent2api-providers`、版本取自
  * `pack.json`、二进制含全部 feature。那份包由官方流水线签名并走索引分发。
  *
- * 本脚本面向「自己留一份小包」的场合：
+ * 本脚本面向「自己留一份包」的场合：
  *   1. **另取包 id** —— 网关的最低版本校验只认两个官方 id
  *      （网关 `plugin_host/compatibility.rs` 的 `OFFICIAL_PACKS`），换一个 id
  *      即不受「插件版本不得低于网关版本」约束，也不会覆盖已装的官方包；
- *   2. **只编一家** —— `cargo build --no-default-features --features <家>`
- *      出来的二进制小一个数量级（全量 15 MB → 单家 3 MB），装到别处不必
- *      连带装上几十家；
+ *   2. **只编挑中的几家** —— `cargo build --no-default-features --features a,b`
+ *      出来的二进制比全量小一个数量级（全量 15 MB → 单家 3 MB）；
  *   3. **不动 pack.json** —— 裁切结果是脚本内的临时清单，官方清单保持原样。
  *      想改官方包请直接编辑 `pack.json` 再走 `pack.mjs`。
+ *
+ * ── 推荐用法：**一个私有包装多家**，不要每家一个包 ────────────
+ * 下面三种做法里只有第一种是常规用法，另外两种是「确实需要隔离」时才用：
+ *
+ * ```bash
+ * # ✅ 常规：一个包承载全部自用 provider，加一家就重出这个包
+ * node scripts/pack-subset.mjs --only minimax,newone,another --id agent2api-custom
+ * ```
+ *
+ * 为什么默认合包，而不是每家 `--id agent2api-<name>` 单独出一份：
+ *
+ *   1. **每包一个进程**。网关 `plugin_host::bootstrap::start` 按包 spawn 宿主
+ *      （`for pack in registry.packs.filter(enabled)`），一个包 = 一个常驻
+ *      二进制进程。三家 = 三个进程，各自还带一份 `ui.js`（1.3 MB）加载。
+ *      包内 provider 之间没有共享可变状态，合包不会把故障扩散 —— 官方包
+ *      几十家本来就在同一个进程里。
+ *   2. **安装期没有跨包 provider 归属校验**。归属是
+ *      `ownership::owners_with` 的 `entry(...).or_insert_with(...)` ——
+ *      **先注册的包赢，后装的静默失效**，日志只有一句「不归插件包「X」接管，
+ *      跳过」；而 `registry.packs` 是 `Vec`，先后取决于安装顺序。两个包声明
+ *      同一个 id 时，谁生效要看你哪天先装的谁 —— 这类故障极难归因。合包
+ *      从结构上不可能遇到。
+ *   3. **`data_dir` 按包分**（网关 `bootstrap.rs` 的 `plugins/<pack.id>/`）。
+ *      同一家 provider 若出现在两个包里，它落盘的机器标识（如
+ *      `qoder-umid/runtime-info`，见插件 `paths.rs`）会各写一份、互不一致。
+ *      一个包内一家只有一份目录，天然一致。
+ *   4. **加封装一次**。包 id 不变、`data_dir` 不变、账号记录里的 `provider`
+ *      字段不变，重装新版本就是原地升级；而换包 id 会让旧包与新包并存
+ *      （网关不会自动清理），账号却只认一个归属。
+ *
+ * 只有这几种情况才该另开包 id：
+ *   · 要**独立分发**（给第三方只装那一家）；
+ *   · 要**独立签名 / 独立发布节奏**，不想跟着私有包一起升版本；
+ *   · 许可或来源必须分开声明。
+ *
+ * ── 默认包名 ────────────────────────────────────────────────
+ * 不传 `--name` 时取 `<pack.json 的 name>（自定义）`，即「提供商增强（自定义）」。
+ * 刻意不自动拼 provider 名单：名单会随 `--only` 变化，包名跟着变的话，界面上
+ * 同一个包每次升级都换个名字。要固定成别的写法就显式传 `--name`。
  *
  * ── 为什么与 pack.mjs 复制而不是复用 ────────────────────────
  * `pack.mjs` 是顶层直接执行的 CLI（`main()` 在文件末尾调用），没有导出任何
@@ -29,12 +67,17 @@
  *
  * ── 用法 ────────────────────────────────────────────────────
  * ```bash
- * # 只打 minimax，包 id 取 agent2api-minimax、版本 1.0.0
- * node scripts/pack-subset.mjs --only minimax --id agent2api-minimax --version 1.0.0
+ * # 常规：一个私有包装多家（包名默认「提供商增强（自定义）」）
+ * node scripts/pack-subset.mjs --only minimax,newone --id agent2api-custom
  *
- * node scripts/pack-subset.mjs --only minimax --id agent2api-minimax --skip-build
- * node scripts/pack-subset.mjs --only cline-free,cline-pass --id agent2api-cline
- * node scripts/pack-subset.mjs --only minimax --id x --target x86_64-pc-windows-msvc
+ * # 加一家：改 --only 重出同一个包 id，重装即原地升级
+ * node scripts/pack-subset.mjs --only minimax,newone,third --id agent2api-custom --version 1.1.0
+ *
+ * # 不重编，直接用现有 release 产物打包
+ * node scripts/pack-subset.mjs --only minimax --id agent2api-custom --skip-build
+ *
+ * # 交叉编译到别的平台
+ * node scripts/pack-subset.mjs --only minimax --id agent2api-custom --target x86_64-unknown-linux-gnu
  * ```
  *
  * 退出码：0 = 成功；1 = 参数 / 清单 / 构建失败。
@@ -327,7 +370,10 @@ function main() {
   const picked = selectProviders(manifest, only)
   const features = featureList(picked)
   const version = options.version.trim() || manifest.version
-  const name = options.name.trim() || `${manifest.name}（${picked.map(item => item.label).join(' / ')}）`
+  // 包名固定为「<官方名>（自定义）」：**不拼 provider 名单**。名单随 --only
+  // 变化，拼进去会让同一个包每次加家都换个显示名；而界面上那一行是用户
+  // 用来认「这是我装的那个包」的，名字该稳定。
+  const name = options.name.trim() || `${manifest.name}（自定义）`
 
   // 与 pack.mjs 同一套产物路径规则：交叉编译时不能误取宿主架构的旧产物
   const targetDir = process.env.CARGO_TARGET_DIR
@@ -364,7 +410,11 @@ function main() {
   const absent = picked.filter(item => binary.indexOf(Buffer.from(item.id, 'utf8')) < 0)
   if (absent.length) {
     console.error(`[subset] 二进制里找不到这些 provider 的痕迹：${absent.map(item => item.id).join(', ')}`)
-    console.error(`[subset] 该二进制可能不是用 --features ${features.join(',')} 编出来的；去掉 --skip-build 重编`)
+    console.error('[subset] 现有二进制不是用这组 feature 编出来的。二选一：')
+    console.error(`[subset]   · 去掉 --skip-build，让本脚本按 --only 重编：`)
+    console.error(`[subset]       node scripts/pack-subset.mjs --only ${only.join(',')} --id ${options.id.trim()}`)
+    console.error(`[subset]   · 或先手动编：cargo build --release -p agent2api-providers \\`)
+    console.error(`[subset]       --no-default-features --features ${features.join(',')}`)
     process.exit(1)
   }
 
