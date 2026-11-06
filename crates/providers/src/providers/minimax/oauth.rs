@@ -12,9 +12,19 @@
 //! ```
 //!
 //! ── 轮询的两种失败形态都要认 ──────────────────────────────────
-//! 实测存在两种：`HTTP 200 + status:"pending"` 与标准 OAuth 的
-//! `非 200 + error:"authorization_pending"`。只认一种会让登录卡在「一直
-//! 在等」或者「立刻失败」，而两种的上游版本都可能出现。
+//! 实测（2026-11-06，`/oauth2/token` 未授权时）存在两种：
+//!   · `HTTP 200 + status:"pending"`；
+//!   · **标准 OAuth 的 `HTTP 400 + error:"authorization_pending"`** ——
+//!     实测上游这一版回的就是这一种：
+//!     `{"error":"authorization_pending","error_description":"the user has
+//!      not finished authorizing yet"}`。
+//!
+//! 只认「200 + pending」那一种会让每次轮询都落进 `parse_token_response`，
+//! 报出「令牌响应缺少 access_token」—— 用户看到的是一句与授权状态无关的
+//! 解析错误，而实际上一切正常、只是在等用户点确认。这个 bug 的隐蔽之处是
+//! **它看起来像「登录成功但没返回账号」**：失败在前一步就发生了。
+//!
+//! 所以下面按 `error` 字段优先判（不看状态码），状态码只用来区分「成功」。
 //!
 //! ── PKCE 为什么必须真算 ──────────────────────────────────────
 //! 上游校验 `code_verifier` 与申请设备码时给的 `code_challenge` 是否匹配
@@ -152,9 +162,14 @@ pub async fn poll_once(
     let ok = (200..300).contains(&status);
     let state = text_of(&body, "status");
     let error = text_of(&body, "error");
+    // ── 判定顺序：先认 `error` 字段，再看状态码 ────────────────────
+    // 上游对「还在等用户授权」回的是 **HTTP 400**，不是 200。把状态码写进
+    // 「等」那几支的匹配条件（早先的写法是 `(true, "", "authorization_pending")`）
+    // 会让这种情况一路落到 `parse_token_response`，报「缺少 access_token」。
+    // 所以除「成功」外一律不看状态码 —— OAuth 的错误语义全在 `error` 里。
     match (ok, state.as_str(), error.as_str()) {
-        // 形态一：HTTP 200 + status
-        (true, "pending", _) | (true, "", "authorization_pending") => {
+        // 形态一：HTTP 200 + status:"pending"
+        (true, "pending", _) | (_, _, "authorization_pending") => {
             PollOutcome::Failed("__pending__".to_string())
         }
         (true, "slow_down", _) | (_, _, "slow_down") => {
@@ -163,13 +178,39 @@ pub async fn poll_once(
         (true, "denied", _) | (true, "access_denied", _) | (_, _, "access_denied") => {
             PollOutcome::Denied
         }
-        (true, "expired", _) | (true, "expired_token", _) | (_, _, "expired_token") => {
-            PollOutcome::Expired
-        }
+        (true, "expired", _) | (_, _, "expired_token") => PollOutcome::Expired,
+        // 只有「HTTP 2xx 且没有 error」才当作拿到了令牌
+        (true, "", "") => match credentials::parse_token_response(&body) {
+            Ok(credentials) => PollOutcome::Granted(credentials),
+            Err(message) => PollOutcome::Failed(message),
+        },
+        // 其余非 2xx：把上游的 error / error_description 原样带出来，比
+        // 「缺少 access_token」有用得多（`invalid_grant` 要用户重新登录，
+        // 网络类问题可以重试，处置完全不同）
+        (false, _, _) => PollOutcome::Failed(describe_error(&body, status)),
         _ => match credentials::parse_token_response(&body) {
             Ok(credentials) => PollOutcome::Granted(credentials),
             Err(message) => PollOutcome::Failed(message),
         },
+    }
+}
+
+/// 非 2xx 的错误正文 → 一句能给用户看的话。
+///
+/// 上游形如 `{"error":"…","error_description":"…"}`，也可能只有 `message`；
+/// 三者都取不到时给出状态码，不让调用方看到空字符串。
+fn describe_error(body: &Value, status: u16) -> String {
+    let code = text_of(body, "error");
+    let detail = text_of(body, "error_description");
+    if code.is_empty() && detail.is_empty() {
+        return format!("换令牌被上游拒绝（HTTP {status}）");
+    }
+    if detail.is_empty() {
+        format!("换令牌被上游拒绝（HTTP {status}）：{code}")
+    } else if code.is_empty() {
+        format!("换令牌被上游拒绝（HTTP {status}）：{detail}")
+    } else {
+        format!("换令牌被上游拒绝（HTTP {status}）：{code}（{detail}）")
     }
 }
 
@@ -210,4 +251,83 @@ pub async fn refresh(
         next.refresh_token = refresh_token.to_string();
     }
     Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 把 `poll_once` 的判定逻辑单独拿出来测：网络不可注入，但「上游回了什么」
+    /// 的解读必须能在此离线校验（这是那个「登录成功却不返回账号」bug 的现场）。
+    fn classify(status: u16, body: &Value) -> &'static str {
+        let ok = (200..300).contains(&status);
+        let state = text_of(body, "status");
+        let error = text_of(body, "error");
+        match (ok, state.as_str(), error.as_str()) {
+            (true, "pending", _) | (_, _, "authorization_pending") => "pending",
+            (true, "slow_down", _) | (_, _, "slow_down") => "slow_down",
+            (true, "denied", _) | (true, "access_denied", _) | (_, _, "access_denied") => "denied",
+            (true, "expired", _) | (_, _, "expired_token") => "expired",
+            (true, "", "") => "token",
+            (false, _, _) => "error",
+            _ => "token",
+        }
+    }
+
+    /// 实测上游形态：**HTTP 400** + authorization_pending。
+    /// 早先的匹配要求 `ok == true`，于是这种行落到解析分支报「缺少
+    /// access_token」—— 用户看到的是「登录完成但没有账号」。
+    #[test]
+    fn pending_is_recognized_on_http_400() {
+        let body = json!({
+            "error": "authorization_pending",
+            "error_description": "the user has not finished authorizing yet"
+        });
+        assert_eq!(classify(400, &body), "pending");
+    }
+
+    /// 同一语义的另一种形态（HTTP 200 + status）也要继续认。
+    #[test]
+    fn pending_is_recognized_on_http_200_shape() {
+        assert_eq!(classify(200, &json!({ "status": "pending" })), "pending");
+    }
+
+    #[test]
+    fn granted_response_is_parsed_as_token() {
+        let body = json!({
+            "access_token": "mmoat_abc",
+            "refresh_token": "mmort_def",
+            "expires_in": 3600
+        });
+        assert_eq!(classify(200, &body), "token");
+        let credentials = credentials::parse_token_response(&body).expect("应解析成功");
+        assert_eq!(credentials.access_token, "mmoat_abc");
+        assert_eq!(credentials.refresh_token, "mmort_def");
+        assert!(credentials.expires_at.is_some());
+    }
+
+    #[test]
+    fn denied_and_expired_keep_their_meaning_on_non_2xx() {
+        assert_eq!(classify(400, &json!({ "error": "access_denied" })), "denied");
+        assert_eq!(classify(400, &json!({ "error": "expired_token" })), "expired");
+    }
+
+    /// 非 2xx 且错误不可识别时，文案要带上游原文而不是空串。
+    #[test]
+    fn describe_error_carries_upstream_text() {
+        let message = describe_error(
+            &json!({ "error": "invalid_grant", "error_description": "code verifier mismatch" }),
+            400,
+        );
+        assert!(message.contains("invalid_grant"), "实际: {message}");
+        assert!(message.contains("code verifier mismatch"), "实际: {message}");
+        assert!(message.contains("400"), "实际: {message}");
+    }
+
+    #[test]
+    fn describe_error_degrades_to_status_when_body_is_empty() {
+        let message = describe_error(&Value::Null, 502);
+        assert!(message.contains("502"), "实际: {message}");
+    }
 }
