@@ -762,22 +762,67 @@ fn parse_catalog(body: &Value) -> Vec<proto::ModelRecord> {
             if let Some(flag) = info.get("reasoning").and_then(Value::as_bool) {
                 fields.insert("supportsReasoning".to_string(), json!(flag));
             }
-            // ── 思考档位：**刻意不写** `efforts` / `reasoningLevels` ────────
-            // 上游目录当前版本（实测 2026-11-06）没有 `effort_options` 字段，
-            // 只有 `thinking_config.mode`（`switchable` / `forced_on`）与
-            // `variants`（`thinking` / `none-thinking` 两套 `thinking.type`）。
-            // 前者决定「能不能关思考」，后者决定「发什么 body」，都不是
-            // 「档位表」。
+            // ── 思考档位：以**本通道目录**为准，不采信社区参考值 ─────────
+            // 上游目录这一版（实测 2026-11-06）**没有** `effort_options`
+            // 字段，只有 `thinking_config.mode`（`switchable` / `forced_on`）
+            // 与 `variants`（`thinking` / `none-thinking` 两套 `thinking.type`）
+            // —— 前者决定「能不能关思考」，后者决定「发什么 body」，都不构成
+            // 档位表。旧版网关的兜底表也是这么记的：
+            // `MiniMax-M3 { effort_options: None }`，注释写明「M3 没有
+            // effort_options ⇒ 没有档位可选，只有开/关两态」。
             //
-            // 档位表在网关的 models.dev 元数据里（`levels`），由
-            // `model_meta::fill::normalize_levels` 补进来：只有**上游没声明**
-            // 档位时才会用 models.dev 那份。这里一旦写个空数组或猜几个档位，
-            // `explicit` 就为真、models.dev 直接被跳过 —— 症状正是「原来能选
-            // low/medium/high，接了插件后没了」。
+            // ⚠️ 这里**必须显式写空数组**，而不是「不写」。
+            // 网关 `model_meta::fill::normalize_levels` 的判定是：
+            //   declared = 上游声明（含空数组）  → explicit = true
+            //   levels   = explicit ? declared : models.dev 的 levels
+            // 不写 = declared 为 None = 用 **models.dev 那份社区参考档位**，
+            // 于是 M3 被凭空赋予 low/medium/high、M3.1-Flash 被赋予
+            // low~max —— 而当前通道根本不认这些值（转发层还会把它们塞进
+            // `output_config.effort` 发出去）。写空数组才是「通道声明了：
+            // 没有多档」，models.dev 不会介入。
             //
-            // `thinking_config.mode` 也不往清单里写：网关侧没有这个键的任何
-            // 消费方（只有 `credit_estimate.rs` 一行注释提到过），写了也不会
-            // 显示。它属于转发知识，见 `chat.rs` 的思考决策表。
+            // 将来上游真在目录里补了 `effort_options`，下面第一支就自动生效，
+            // 不需要改这里。
+            if info.get("reasoning").and_then(Value::as_bool) == Some(true) {
+                let efforts: Vec<Value> = info
+                    .get("effort_options")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        let mut seen = std::collections::HashSet::new();
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty())
+                            .filter(|text| seen.insert(text.to_string()))
+                            .map(|text| json!(text))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                fields.insert("efforts".to_string(), Value::Array(efforts));
+                // `default_effort` 必须落在档位表内，否则丢弃（不编造）——
+                // 上游真给了就直接用，网关凭它预选。实测 M3.1-Flash 是
+                // `"default"`，M3 没有这个字段。
+                if let Some(default) = info
+                    .get("default_effort")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .filter(|text| {
+                        fields
+                            .get("efforts")
+                            .and_then(Value::as_array)
+                            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(*text)))
+                    })
+                {
+                    // 键名必须是 `reasoningDefaultLevel`：网关
+                    // `model_meta::fill::normalize_levels` 只认它和
+                    // `reasoning.defaultEffort`，顶层 `defaultEffort` 会被
+                    // 忽略（写错也不会报错，只是预选档位静默为空）。它随后
+                    // 被网关投影成出口的 `reasoning_default_effort`。
+                    fields.insert("reasoningDefaultLevel".to_string(), json!(default));
+                }
+            }
             if let Some(flag) = info.get("tool_call").and_then(Value::as_bool) {
                 fields.insert("supportsToolCall".to_string(), json!(flag));
             }
@@ -925,16 +970,66 @@ mod catalog_tests {
         }
     }
 
-    /// **不写档位**：上游没有 `effort_options`，档位由网关的 models.dev 补。
-    /// 这里一旦写出 `efforts`（哪怕是空数组），网关 `normalize_levels` 的
-    /// `explicit` 就为真、models.dev 被跳过 —— 症状是「接了插件后档位没了」。
+    /// 档位以**本通道目录**为准：目录没有 `effort_options` 时显式写空数组，
+    /// 让网关不去采用 models.dev 的社区参考档位。
+    ///
+    /// 为什么必须是「空数组」而不是「不写」：网关 `normalize_levels` 里
+    /// 不写 ⇒ declared 为 None ⇒ 回落到 models.dev 的 `levels`，于是 M3
+    /// 被赋予 low/medium/high（当前通道不认），转发层还会把选中的值塞进
+    /// `output_config.effort` 发出去。空数组 = 「上游声明：没有多档」。
     #[test]
-    fn catalog_never_declares_efforts() {
+    fn catalog_declares_empty_efforts_when_upstream_has_none() {
         let models = parse_catalog(&live_shape());
         for model in &models {
-            for key in ["efforts", "reasoningEfforts", "reasoningLevels"] {
-                assert!(model.get(key).is_none(), "{key} 不该由插件声明：{model}");
+            // M2.7 在这个夹具里 reasoning=false —— 不开思考的模型不声明档位
+            if model["supportsReasoning"] == true {
+                assert_eq!(model["efforts"], json!([]), "应显式声明空档位：{model}");
+            } else {
+                assert!(model.get("efforts").is_none(), "不开思考不该有档位键：{model}");
             }
         }
+    }
+
+    /// 上游真的给了 `effort_options` 时原样采用（去重保序），并带上
+    /// `default_effort` —— 实测 M3.1-Flash 就是这一档：
+    /// `["default","low","medium","high","xhigh","max"]` + `default_effort:"default"`。
+    #[test]
+    fn catalog_uses_upstream_effort_options() {
+        let body = json!({
+            "providers": [{ "config": { "models": {
+                "MiniMax-M9": {
+                    "reasoning": true,
+                    "effort_options": ["low", "medium", "medium", "high"],
+                    "default_effort": "medium"
+                }
+            } } }]
+        });
+        let models = parse_catalog(&body);
+        assert_eq!(models[0]["efforts"], json!(["low", "medium", "high"]), "{models:?}");
+        assert_eq!(models[0]["reasoningDefaultLevel"], "medium");
+    }
+
+    /// `default_effort` 不在档位表里就丢弃（不编造）。
+    #[test]
+    fn catalog_drops_out_of_range_default_effort() {
+        let body = json!({
+            "providers": [{ "config": { "models": {
+                "M": { "reasoning": true, "effort_options": ["low"], "default_effort": "max" }
+            } } }]
+        });
+        let models = parse_catalog(&body);
+        assert_eq!(models[0]["efforts"], json!(["low"]));
+        assert!(models[0].get("reasoningDefaultLevel").is_none(), "{models:?}");
+    }
+
+    /// 不开思考的模型不写 `efforts` 键（写了会被当成「支持档位」）。
+    #[test]
+    fn catalog_skips_efforts_for_non_reasoning_models() {
+        let body = json!({
+            "providers": [{ "config": { "models": {
+                "M": { "reasoning": false }
+            } } }]
+        });
+        assert!(parse_catalog(&body)[0].get("efforts").is_none());
     }
 }
