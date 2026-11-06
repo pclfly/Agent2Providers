@@ -134,6 +134,11 @@ const ICON_FALLBACK = {
 const ICON_FILES = {
   'minimax-code': 'minimax-code.svg',
   'minimax-code-global': 'minimax-code.svg',
+  // MiniMax 的 live 身份（`minimax`，国内站 agent.minimax.cn）与上面那两个
+  // 停用身份是**同一个品牌**，共用同一张图。网关 `plugin_theme` 的图标表里
+  // 只有 SVG 那几个才是 `.svg`（见 `MINIMAX_CODE_SVG`），默认按 `<id>.png`
+  // 拼路径会 404 —— 所以必须在这里显式写文件名。
+  minimax: 'minimax-code.svg',
 };
 
 export function providerBadge(id, label) {
