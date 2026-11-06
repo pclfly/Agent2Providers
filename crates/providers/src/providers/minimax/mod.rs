@@ -729,7 +729,31 @@ fn parse_catalog(body: &Value) -> Vec<proto::ModelRecord> {
             let Some(fields) = record.as_object_mut() else {
                 continue;
             };
-            if let Some(context) = info.pointer("/limit/context").and_then(Value::as_i64) {
+            // ── 上下文窗口：取 `context_window_options` 的**最大档** ──────
+            // 不能直接用 `limit.context`。实测（2026-11-06）M3 的上游目录是
+            // `limit.context = 512000` 而 `context_window_options = [512000,
+            // 1000000]`（1M 那档带 `context_window_option_hints.1000000 =
+            // "higher_usage"`，即「用满 1M 会多算额度」，不是「不支持」）。
+            //
+            // 为什么这条特别重要：网关 `model_meta::fill` 对**上游已声明**的
+            // `maxInputTokens` 是「岿然不动」—— 一旦这里写了 512000，
+            // models.dev 那条 `context: 1048576` 就不会再被采用（`capSources`
+            // 记成 upstream）。于是用户在模型页看到的上下文永久偏小一半，
+            // 而且看起来像上游的真实声明，查起来会往上游找。
+            let context = info
+                .get("context_window_options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(Value::as_i64)
+                        .filter(|value| *value > 0)
+                        .max()
+                        .unwrap_or(0)
+                })
+                .filter(|value| *value > 0)
+                .or_else(|| info.pointer("/limit/context").and_then(Value::as_i64));
+            if let Some(context) = context {
                 fields.insert("maxInputTokens".to_string(), json!(context));
             }
             if let Some(output) = info.pointer("/limit/output").and_then(Value::as_i64) {
@@ -738,6 +762,22 @@ fn parse_catalog(body: &Value) -> Vec<proto::ModelRecord> {
             if let Some(flag) = info.get("reasoning").and_then(Value::as_bool) {
                 fields.insert("supportsReasoning".to_string(), json!(flag));
             }
+            // ── 思考档位：**刻意不写** `efforts` / `reasoningLevels` ────────
+            // 上游目录当前版本（实测 2026-11-06）没有 `effort_options` 字段，
+            // 只有 `thinking_config.mode`（`switchable` / `forced_on`）与
+            // `variants`（`thinking` / `none-thinking` 两套 `thinking.type`）。
+            // 前者决定「能不能关思考」，后者决定「发什么 body」，都不是
+            // 「档位表」。
+            //
+            // 档位表在网关的 models.dev 元数据里（`levels`），由
+            // `model_meta::fill::normalize_levels` 补进来：只有**上游没声明**
+            // 档位时才会用 models.dev 那份。这里一旦写个空数组或猜几个档位，
+            // `explicit` 就为真、models.dev 直接被跳过 —— 症状正是「原来能选
+            // low/medium/high，接了插件后没了」。
+            //
+            // `thinking_config.mode` 也不往清单里写：网关侧没有这个键的任何
+            // 消费方（只有 `credit_estimate.rs` 一行注释提到过），写了也不会
+            // 显示。它属于转发知识，见 `chat.rs` 的思考决策表。
             if let Some(flag) = info.get("tool_call").and_then(Value::as_bool) {
                 fields.insert("supportsToolCall".to_string(), json!(flag));
             }
@@ -834,5 +874,67 @@ mod catalog_tests {
     fn catalog_rejects_unknown_shape() {
         assert!(parse_catalog(&json!({ "data": [{ "id": "x" }] })).is_empty());
         assert!(parse_catalog(&json!({})).is_empty());
+    }
+
+    /// 上下文窗口取 `context_window_options` 的**最大档**，不是 `limit.context`。
+    ///
+    /// 现场（2026-11-06 实测）：M3 是 `limit.context = 512000` +
+    /// `context_window_options = [512000, 1000000]`。写 512000 的话网关
+    /// `model_meta::fill` 会把它当「上游已声明」而拒绝采用 models.dev 的
+    /// 1048576，用户在模型页看到的上下文永久偏小一半。
+    #[test]
+    fn catalog_uses_largest_context_option() {
+        let body = json!({
+            "providers": [{
+                "config": { "models": {
+                    "MiniMax-M3": {
+                        "name": "M3",
+                        "limit": { "context": 512000, "output": 128000 },
+                        "context_window_options": [512000, 1000000],
+                        "context_window_option_hints": { "1000000": "higher_usage" }
+                    }
+                } }
+            }]
+        });
+        let models = parse_catalog(&body);
+        assert_eq!(models[0]["maxInputTokens"], 1000000, "{models:?}");
+        assert_eq!(models[0]["maxOutputTokens"], 128000);
+    }
+
+    /// 没有 `context_window_options` 时回落 `limit.context`（老目录形态）。
+    #[test]
+    fn catalog_falls_back_to_limit_context() {
+        let body = json!({
+            "providers": [{ "config": { "models": {
+                "MiniMax-M2.5": { "name": "M2.5", "limit": { "context": 204800 } }
+            } } }]
+        });
+        assert_eq!(parse_catalog(&body)[0]["maxInputTokens"], 204800);
+    }
+
+    /// 空数组 / 全非正数时也回落 —— 不能让「有字段但没值」把窗口写成 0。
+    #[test]
+    fn catalog_ignores_empty_context_options() {
+        for options in [json!([]), json!([0, -1])] {
+            let body = json!({
+                "providers": [{ "config": { "models": {
+                    "M": { "limit": { "context": 131072 }, "context_window_options": options }
+                } } }]
+            });
+            assert_eq!(parse_catalog(&body)[0]["maxInputTokens"], 131072, "{body}");
+        }
+    }
+
+    /// **不写档位**：上游没有 `effort_options`，档位由网关的 models.dev 补。
+    /// 这里一旦写出 `efforts`（哪怕是空数组），网关 `normalize_levels` 的
+    /// `explicit` 就为真、models.dev 被跳过 —— 症状是「接了插件后档位没了」。
+    #[test]
+    fn catalog_never_declares_efforts() {
+        let models = parse_catalog(&live_shape());
+        for model in &models {
+            for key in ["efforts", "reasoningEfforts", "reasoningLevels"] {
+                assert!(model.get(key).is_none(), "{key} 不该由插件声明：{model}");
+            }
+        }
     }
 }
