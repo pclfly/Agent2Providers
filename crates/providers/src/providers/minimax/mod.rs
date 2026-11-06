@@ -762,29 +762,23 @@ fn parse_catalog(body: &Value) -> Vec<proto::ModelRecord> {
             if let Some(flag) = info.get("reasoning").and_then(Value::as_bool) {
                 fields.insert("supportsReasoning".to_string(), json!(flag));
             }
-            // ── 思考档位：以**本通道目录**为准，不采信社区参考值 ─────────
-            // 上游目录这一版（实测 2026-11-06）**没有** `effort_options`
-            // 字段，只有 `thinking_config.mode`（`switchable` / `forced_on`）
-            // 与 `variants`（`thinking` / `none-thinking` 两套 `thinking.type`）
-            // —— 前者决定「能不能关思考」，后者决定「发什么 body」，都不构成
-            // 档位表。旧版网关的兜底表也是这么记的：
-            // `MiniMax-M3 { effort_options: None }`，注释写明「M3 没有
-            // effort_options ⇒ 没有档位可选，只有开/关两态」。
+            // ── 思考档位：通道优先，通道没给才让社区参考值兜底 ───────────
+            // 判定顺序（与网关 `model_meta::fill::normalize_levels` 配合）：
+            //   ① 上游目录有 `effort_options` → **用通道的**（这是最权威的：
+            //      实测评测通道上真能跑哪些档位就看这里）；
+            //   ② 上游没给 → **不写这个键** → 网关回落到 models.dev 的
+            //      `levels`（社区参考档位），作为「通道没声明时的兜底」。
             //
-            // ⚠️ 这里**必须显式写空数组**，而不是「不写」。
-            // 网关 `model_meta::fill::normalize_levels` 的判定是：
-            //   declared = 上游声明（含空数组）  → explicit = true
+            // ⚠️ 第 ② 步**不能写空数组**。`normalize_levels` 的判定是：
+            //   declared = 上游声明（空数组也算声明） → explicit = true
             //   levels   = explicit ? declared : models.dev 的 levels
-            // 不写 = declared 为 None = 用 **models.dev 那份社区参考档位**，
-            // 于是 M3 被凭空赋予 low/medium/high、M3.1-Flash 被赋予
-            // low~max —— 而当前通道根本不认这些值（转发层还会把它们塞进
-            // `output_config.effort` 发出去）。写空数组才是「通道声明了：
-            // 没有多档」，models.dev 不会介入。
+            // 写成空数组 = 「上游明确说了没有档位」，models.dev 直接失效，
+            // 用户一个档位都选不到 —— 那是比「多给几个社区档位」更糟的退化。
+            // 不写才留出兜底路径。
             //
-            // 将来上游真在目录里补了 `effort_options`，下面第一支就自动生效，
-            // 不需要改这里。
+            // 一句话：**有则用通道，无则用社区；不让社区值覆盖通道值。**
             if info.get("reasoning").and_then(Value::as_bool) == Some(true) {
-                let efforts: Vec<Value> = info
+                let declared: Option<Vec<Value>> = info
                     .get("effort_options")
                     .and_then(Value::as_array)
                     .map(|items| {
@@ -798,30 +792,29 @@ fn parse_catalog(body: &Value) -> Vec<proto::ModelRecord> {
                             .map(|text| json!(text))
                             .collect()
                     })
-                    .unwrap_or_default();
-                fields.insert("efforts".to_string(), Value::Array(efforts));
-                // `default_effort` 必须落在档位表内，否则丢弃（不编造）——
-                // 上游真给了就直接用，网关凭它预选。实测 M3.1-Flash 是
-                // `"default"`，M3 没有这个字段。
-                if let Some(default) = info
-                    .get("default_effort")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .filter(|text| {
-                        fields
-                            .get("efforts")
-                            .and_then(Value::as_array)
-                            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(*text)))
-                    })
-                {
-                    // 键名必须是 `reasoningDefaultLevel`：网关
-                    // `model_meta::fill::normalize_levels` 只认它和
-                    // `reasoning.defaultEffort`，顶层 `defaultEffort` 会被
-                    // 忽略（写错也不会报错，只是预选档位静默为空）。它随后
-                    // 被网关投影成出口的 `reasoning_default_effort`。
-                    fields.insert("reasoningDefaultLevel".to_string(), json!(default));
+                    // 只有「非空」才算通道声明；空数组视同没给，走社区兜底
+                    .filter(|items: &Vec<Value>| !items.is_empty());
+                if let Some(efforts) = declared {
+                    // `default_effort` 必须落在**通道给的**档位表内，否则丢弃
+                    // （不编造）。实测 M3.1-Flash 是 `"default"`，M3 没有这个
+                    // 字段 —— 所以它只在「通道声明了档位」这一支里生效。
+                    let default = info
+                        .get("default_effort")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .filter(|text| efforts.iter().any(|item| item.as_str() == Some(*text)))
+                        .map(str::to_string);
+                    fields.insert("efforts".to_string(), Value::Array(efforts));
+                    if let Some(default) = default {
+                        // 键名必须是 `reasoningDefaultLevel`：网关只认它和
+                        // `reasoning.defaultEffort`，顶层 `defaultEffort` 会被
+                        // 忽略（写错不报错，只是预选档位静默为空）。它随后被
+                        // 投影成出口的 `reasoning_default_effort`。
+                        fields.insert("reasoningDefaultLevel".to_string(), json!(default));
+                    }
                 }
+                // declared 为 None → 这里什么都不写 → 网关用 models.dev 兜底
             }
             if let Some(flag) = info.get("tool_call").and_then(Value::as_bool) {
                 fields.insert("supportsToolCall".to_string(), json!(flag));
@@ -970,24 +963,36 @@ mod catalog_tests {
         }
     }
 
-    /// 档位以**本通道目录**为准：目录没有 `effort_options` 时显式写空数组，
-    /// 让网关不去采用 models.dev 的社区参考档位。
+    /// 通道没给 `effort_options` 时**不写**档位键，留给网关用社区参考值兜底。
     ///
-    /// 为什么必须是「空数组」而不是「不写」：网关 `normalize_levels` 里
-    /// 不写 ⇒ declared 为 None ⇒ 回落到 models.dev 的 `levels`，于是 M3
-    /// 被赋予 low/medium/high（当前通道不认），转发层还会把选中的值塞进
-    /// `output_config.effort` 发出去。空数组 = 「上游声明：没有多档」。
+    /// 这是「有则用通道，无则用社区」的第二步。写成空数组的话，网关
+    /// `normalize_levels` 会把空数组当成「上游明确声明没有档位」
+    /// （`explicit = true`），models.dev 的 `levels` 直接失效，用户一个档位
+    /// 都选不到 —— 比多给几个社区档位更糟。
     #[test]
-    fn catalog_declares_empty_efforts_when_upstream_has_none() {
+    fn catalog_leaves_efforts_unset_when_upstream_has_none() {
         let models = parse_catalog(&live_shape());
         for model in &models {
-            // M2.7 在这个夹具里 reasoning=false —— 不开思考的模型不声明档位
-            if model["supportsReasoning"] == true {
-                assert_eq!(model["efforts"], json!([]), "应显式声明空档位：{model}");
-            } else {
-                assert!(model.get("efforts").is_none(), "不开思考不该有档位键：{model}");
-            }
+            // 夹具里 M3 与 M2.7 都没有 effort_options
+            assert!(
+                model.get("efforts").is_none(),
+                "通道没给档位就不该写这个键（要留给 models.dev 兜底）：{model}"
+            );
         }
+    }
+
+    /// 空数组视同「没给」：不能让它把社区兜底挡掉。
+    #[test]
+    fn catalog_treats_empty_effort_options_as_absent() {
+        let body = json!({
+            "providers": [{ "config": { "models": {
+                "M": { "reasoning": true, "effort_options": [] }
+            } } }]
+        });
+        assert!(
+            parse_catalog(&body)[0].get("efforts").is_none(),
+            "空数组应视同没给，留给 models.dev 兜底"
+        );
     }
 
     /// 上游真的给了 `effort_options` 时原样采用（去重保序），并带上
