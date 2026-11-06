@@ -148,6 +148,34 @@ impl Provider for MiniMaxProvider {
         })
     }
 
+    /// 动态登录方式（网关「添加账号」弹窗按它渲染表单）。
+    ///
+    /// ── 为什么必须实现（2026-11 修）─────────────────────────────
+    /// 网关优先问 `auth.methods`；不实现时**整块降级成「手动凭证 JSON」**，
+    /// 用户看不到「用 MiniMax 账号登录」这个入口 —— 而 `login_start` /
+    /// `login_poll` / `login_cancel` 三条（设备码 + PKCE）本来就是通的，
+    /// 只差把方式清单报出去。症状是「有实现但没有按钮」。
+    ///
+    /// `methodIndex` 只用于界面区分；真正发起登录时网关固定传
+    /// `method: "browser"`，具体走哪条由 `login_start` 内部的 method 判断
+    /// 决定（见那里的说明）。
+    fn admin_action<'a>(
+        &'a self,
+        _ctx: &'a PluginCtx,
+        _account: &'a str,
+        action: &'a str,
+        _payload: &'a Value,
+    ) -> SendFuture<'a, Value> {
+        Box::pin(async move {
+            match action {
+                "auth.methods" => Ok(login_methods()),
+                other => Err(agent2api_provider_sdk::unsupported(format!(
+                    "MiniMax 不支持管理动作「{other}」"
+                ))),
+            }
+        })
+    }
+
     /// 上游 401/403 一律按「令牌失效」处置（引导用户重新粘贴）。
     fn classify(&self, status: u16, body: &Value) -> proto::ErrorClass {
         // 上游的错误体常带 `base_resp.status_msg`，把它带给用户比「HTTP 401」有用
@@ -544,6 +572,47 @@ impl Provider for MiniMaxProvider {
             Ok(())
         })
     }
+}
+
+/// 界面上的两种登录方式（字段名按网关 `auth.methods` 的 camelCase 契约）。
+///
+/// ── 为什么是「粘贴令牌」+「网页登录」这两种 ─────────────────
+/// 上游只接受两条路：拿 `mmoat_` 访问令牌直接打推理端点，或者走 OAuth
+/// 设备码换一对新令牌。前者适合从别处导出过令牌的人，后者是正常登录。
+fn login_methods() -> Value {
+    json!({
+        "methods": [
+            {
+                "methodIndex": 0,
+                "type": "oauth",
+                "label": "用 MiniMax 账号登录",
+                "instructions": "会打开官方授权页；在页面上确认后本机自动完成登录",
+                "prompts": [],
+                "localOnly": false,
+                "manualCallback": false,
+                "callbackInput": "url"
+            },
+            {
+                "methodIndex": 1,
+                "type": "api",
+                "label": "粘贴访问令牌",
+                "instructions": "粘贴 mmoat_ 开头的访问令牌。没有刷新令牌时，过期后需要重新粘贴。",
+                "prompts": [
+                    {
+                        "key": "token",
+                        "type": "text",
+                        "label": "访问令牌",
+                        "placeholder": "mmoat_…",
+                        "secret": true,
+                        "optional": false
+                    }
+                ],
+                "localOnly": false,
+                "manualCallback": false,
+                "callbackInput": "url"
+            }
+        ]
+    })
 }
 
 /// 内置清单形态的目录（`remote=false`）。
