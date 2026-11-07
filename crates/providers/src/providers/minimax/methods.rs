@@ -269,18 +269,52 @@ pub(super) async fn control_post(
 
 /// 把续期后的凭证写回账号（**必须写**：上游会轮换 refresh_token）。
 pub(super) async fn persist(ctx: &PluginCtx, account: &str, credentials: &Credentials) {
-    // 只写 secret：SDK 的 `store_update` 没有带 public 的变体（三个参数：
-    // account / expect / secret），`expiresAt` 靠宿主从 secret 自行投影。
-    let secret = credentials.to_record(credentials.expires_at);
-    if let Err(error) = ctx
-        .store_update(account, &Value::Null, &secret)
-        .await
-    {
-        // 续期本身成功了，写回失败只影响下次续期 —— 记一行，不把这次请求拖垮
-        crate::logging::log(
-            "[MiniMax]",
-            &format!("⚠️ 续期结果写回账号失败（{account}）：{error}"),
-        );
+    // expect 必须是**读到的原始 secret**：网关按比较再写，传 `Null` 恒不等 →
+    // 返回 `updated:false` 而不是 Err，写永远落不进盘（浏览授权账号过保质期后
+    // 401 的成因即此）。只动令牌三个键，其余身份载荷原样保留。
+    let (_id, before) = match crate::store::secret(ctx, super::ID, account).await {
+        Ok(found) => found,
+        Err(error) => {
+            // 读不到原始 secret 就写不出 expect —— 续期本身成功了，记一行不拖垮请求
+            crate::logging::log(
+                "[MiniMax]",
+                &format!("⚠️ 续期结果写回账号失败（读不到原始凭证，{account}）：{error}"),
+            );
+            return;
+        }
+    };
+    let next = crate::store::with_fields(
+        &before,
+        &[
+            ("accessToken", Value::String(credentials.access_token.clone())),
+            ("refreshToken", Value::String(credentials.refresh_token.clone())),
+            ("expiresAt", credentials_to_expires_value(credentials.expires_at)),
+        ],
+    );
+    match ctx.store_update(account, &before, &next).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // 期望值已变 = 另一路刷新先落盘了：那一份比我们手里的更新，记一行
+            // 让用户能追溯，不要当成功。
+            crate::logging::log(
+                "[MiniMax]",
+                &format!("⚠️ 续期结果未写回账号（{account}：并发刷新已更新凭证）"),
+            );
+        }
+        Err(error) => {
+            crate::logging::log(
+                "[MiniMax]",
+                &format!("⚠️ 续期结果写回账号失败（{account}）：{error}"),
+            );
+        }
+    }
+}
+
+/// `expiresAt` 写入形态：与登录落盘一致（`normalized_from` 的 `Option<i64>`）。
+fn credentials_to_expires_value(expires_at: Option<i64>) -> Value {
+    match expires_at {
+        Some(at) => Value::from(at),
+        None => Value::Null,
     }
 }
 
